@@ -9,6 +9,9 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain.tools.retriever import create_retriever_tool
+from langchain import hub
+from langchain.agents import create_openai_functions_agent, AgentExecutor
+# from langchain.agents import 
 
 loader = WebBaseLoader("https://docs.smith.langchain.com/user_guide")
 llm = OpenAI()
@@ -26,23 +29,18 @@ vector = FAISS.from_documents(documents, embeddings)
 #6. Create the retriever
 retriever = vector.as_retriever()
 
-# search tool
-retriever_tool = create_retriever_tool(
-    retriever,
-    "langsmith_search",
-    "Search for information about LangSmith. For any questions about LangSmith, you must use this tool!",
-)
-
-tools = [retriever_tool]
-
 # Create the context dynamically by retrieving documents from the vector store
 def create_context_from_documents(input_query):
-    docs = retriever.invoke(input_query)
+    print('input_query: ', input_query)
+    # Pass the correct input format to retriever.invoke
+    result = retriever.invoke(input_query)
+    print('result: ', result)
+    docs = result if isinstance(result, list) else result['documents']
     context = "\n\n".join([doc.page_content for doc in docs])
     return context
 
 #7. Create the prompt
-prompt = ChatPromptTemplate.from_template("""Answer the following question based only on the provided context:
+doc_prompt = ChatPromptTemplate.from_template("""Answer the following question based only on the provided context:
 
 <context>
 {context}
@@ -51,7 +49,7 @@ prompt = ChatPromptTemplate.from_template("""Answer the following question based
 Question: {input}""")
 
 #8. Create the document chain
-document_chain = create_stuff_documents_chain(llm, prompt)
+document_chain = create_stuff_documents_chain(llm, doc_prompt)
 
 retriever_prompt = ChatPromptTemplate.from_messages([
     ("system", "Answer the user's questions based on the below context:\n\n{context}"),
@@ -63,6 +61,18 @@ retriever_chain = create_history_aware_retriever(llm, retriever, retriever_promp
 #10. Create the retrieval chain (document + history)
 retrieval_chain = create_retrieval_chain(retriever_chain, document_chain)
 
+# search tool
+retriever_tool = create_retriever_tool(
+    retrieval_chain,
+    "langsmith_search",
+    "Search for information about LangSmith. For any questions about LangSmith, you must use this tool!"
+)
+
+agent_prompt = hub.pull("hwchase17/openai-functions-agent")
+agent_llm = ChatOpenAI()
+tools = [retriever_tool]
+agent = create_openai_functions_agent(llm, tools, agent_prompt)
+agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 
 chat_history = [
   HumanMessage(content="Can LangSmith help test my LLM applications?"), 
@@ -76,10 +86,14 @@ chat_history = [
   ]
 input_query = "When developing new LLM applications, what does the document suggest?"
 context = create_context_from_documents(input_query)
-result = retrieval_chain.invoke({
+print('context: ', context)
+
+# Invoke agent with chat history, input query, and context
+result = agent_executor.invoke({
     "chat_history": chat_history,
-    "context": context,
     "input": input_query,
+    # "context": context
 })
 
+print(result)
 print(result["answer"])

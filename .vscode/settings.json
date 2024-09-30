@@ -1,0 +1,8 @@
+{
+  "cmake.configureOnOpen": true,
+  "[python]": {
+    "editor.insertSpaces": true,
+    "editor.tabSize": 4
+  },
+  "python.analysis.typeCheckingMode": "off"
+}
