@@ -1,12 +1,14 @@
 import psycopg2
 import json
-import re
 from psycopg2.extras import execute_values
 
 def create_table_if_not_exists(connection_string):
     conn = psycopg2.connect(connection_string)
     cur = conn.cursor()
     
+    # Enable PostGIS extension if not already enabled
+    cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+
     # Check if table exists
     cur.execute("""
     SELECT EXISTS (
@@ -17,7 +19,7 @@ def create_table_if_not_exists(connection_string):
     table_exists = cur.fetchone()[0]
     
     if not table_exists:
-        # Create table
+        # Create table with PostGIS geometry
         cur.execute("""
         CREATE TABLE road_segments (
             id SERIAL PRIMARY KEY,
@@ -25,47 +27,10 @@ def create_table_if_not_exists(connection_string):
             road_name VARCHAR(255),
             shape_length FLOAT,
             speed_limit INTEGER,
-            coordinates JSONB
+            geom GEOMETRY(LINESTRING, 4326)
         );
         
-        CREATE INDEX idx_road_segments_coordinates ON road_segments USING GIN (coordinates);
-        
-        -- Function to calculate distance between two points (in degrees)
-        CREATE OR REPLACE FUNCTION calculate_distance(
-            lon1 FLOAT, lat1 FLOAT,
-            lon2 FLOAT, lat2 FLOAT
-        ) RETURNS FLOAT AS $$
-        BEGIN
-            RETURN SQRT(POW(lon2 - lon1, 2) + POW(lat2 - lat1, 2));
-        END;
-        $$ LANGUAGE plpgsql;
-        
-        -- Function to find the minimum distance from a point to a line segment
-        CREATE OR REPLACE FUNCTION min_distance_to_segment(
-            point_lon FLOAT, point_lat FLOAT,
-            segment JSONB
-        ) RETURNS FLOAT AS $$
-        DECLARE
-            start_point JSONB;
-            end_point JSONB;
-            dist FLOAT;
-        BEGIN
-            start_point := segment->0;
-            end_point := segment->1;
-            
-            dist := calculate_distance(
-                point_lon, point_lat,
-                (start_point->>0)::FLOAT, (start_point->>1)::FLOAT
-            );
-            
-            dist := LEAST(dist, calculate_distance(
-                point_lon, point_lat,
-                (end_point->>0)::FLOAT, (end_point->>1)::FLOAT
-            ));
-            
-            RETURN dist;
-        END;
-        $$ LANGUAGE plpgsql;
+        CREATE INDEX idx_road_segments_geom ON road_segments USING GIST (geom);
         """)
         conn.commit()
         print("Table 'road_segments' created successfully.")
@@ -74,14 +39,6 @@ def create_table_if_not_exists(connection_string):
     
     cur.close()
     conn.close()
-
-def parse_speed_limit(speed_limit_str):
-    # Remove any non-digit characters
-    digits = re.findall(r'\d+', speed_limit_str)
-    if not digits:
-        return None
-    # If there's a range, take the higher value
-    return int(max(digits))
 
 def insert_road_data(connection_string, geojson_file_path):
     # Read GeoJSON file
@@ -96,35 +53,62 @@ def insert_road_data(connection_string, geojson_file_path):
     
     # Prepare the data for batch insert
     values = []
-    for feature in features:
+    for index, feature in enumerate(features):
         try:
-            speed_limit_str = feature['properties']['ns_speed_limit']
-            speed_limit = parse_speed_limit(speed_limit_str)
+            properties = feature['properties']
+            geometry = feature['geometry']
             
-            if speed_limit is None:
-                print(f"Warning: Unable to parse speed limit '{speed_limit_str}'. Skipping this record.")
-                continue
+            if geometry['type'] != 'LineString':
+                raise ValueError(f"Unsupported geometry type: {geometry['type']}")
+            
+            speed_limit = properties.get('ns_speed_limit', '0')
+            speed_limit = int(speed_limit) if isinstance(speed_limit, str) and speed_limit.isdigit() else 0
+            
+            coordinates = geometry['coordinates']
+            linestring = f"LINESTRING({','.join([f'{lon} {lat}' for lon, lat in coordinates])})"
             
             values.append((
-                feature['properties']['road_id'],
-                feature['properties']['road_name'],
-                feature['properties']['Shape__Length'],
+                properties.get('road_id', 0),
+                properties.get('road_name', ''),
+                properties.get('Shape__Length', 0.0),
                 speed_limit,
-                json.dumps(feature['geometry']['coordinates'])
+                linestring
             ))
         except KeyError as e:
-            print(f"Warning: Skipping a record due to missing key: {e}")
+            print(f"Warning: Skipping record {index} due to missing key: {e}")
+        except ValueError as e:
+            print(f"Warning: Skipping record {index} due to value error: {e}")
         except Exception as e:
-            print(f"Warning: Skipping a record due to unexpected error: {e}")
+            print(f"Warning: Skipping record {index} due to unexpected error: {e}")
     
     # Perform batch insert
-    execute_values(cur, """
-        INSERT INTO road_segments 
-        (ramm_road_id, road_name, shape_length, speed_limit, coordinates) 
-        VALUES %s
-    """, values)
+    try:
+        execute_values(cur, """
+            INSERT INTO road_segments 
+            (ramm_road_id, road_name, shape_length, speed_limit, geom) 
+            VALUES %s
+        """, [(v[0], v[1], v[2], v[3], f"ST_GeomFromText('{v[4]}', 4326)") for v in values])
+        
+        conn.commit()
+        print(f"Successfully inserted {len(values)} road segments.")
+    except Exception as e:
+        conn.rollback()
+        print(f"Error during batch insert: {e}")
+        # If batch insert fails, try inserting records one by one
+        print("Attempting to insert records individually...")
+        for v in values:
+            try:
+                cur.execute("""
+                    INSERT INTO road_segments 
+                    (ramm_road_id, road_name, shape_length, speed_limit, geom) 
+                    VALUES (%s, %s, %s, %s, ST_GeomFromText(%s, 4326))
+                """, (v[0], v[1], v[2], v[3], v[4]))
+                conn.commit()
+                print(f"Successfully inserted road segment: {v[1]}")
+            except Exception as e:
+                conn.rollback()
+                print(f"Error inserting road segment {v[1]}: {e}")
     
-    conn.commit()
     cur.close()
     conn.close()
     
@@ -135,27 +119,28 @@ def query_nearest_road(connection_string, lat, lon):
     cur = conn.cursor()
     
     cur.execute("""
-    WITH point_distances AS (
-        SELECT 
-            id, 
-            road_name, 
-            speed_limit,
-            MIN(min_distance_to_segment(%s, %s, segment)) AS min_distance
-        FROM road_segments,
-             jsonb_array_elements(coordinates) WITH ORDINALITY AS coords(segment, idx)
-        GROUP BY id, road_name, speed_limit
-    )
-    SELECT road_name, speed_limit, min_distance
-    FROM point_distances
-    ORDER BY min_distance
+    SELECT 
+        road_name, 
+        speed_limit, 
+        ST_Distance(geom, ST_SetSRID(ST_MakePoint(%s, %s), 4326)) AS distance
+    FROM road_segments
+    ORDER BY geom <-> ST_SetSRID(ST_MakePoint(%s, %s), 4326)
     LIMIT 1;
-    """, (lon, lat))
+    """, (lon, lat, lon, lat))
     
     result = cur.fetchone()
     cur.close()
     conn.close()
     
     return result
+
+def test_insertion_and_query(connection_string, test_lat, test_lon):
+    print("\nTesting data insertion and querying:")
+    nearest_road = query_nearest_road(connection_string, test_lat, test_lon)
+    if nearest_road:
+        print(f"Nearest road: {nearest_road[0]}, Speed limit: {nearest_road[1]} kph, Distance: {nearest_road[2]:.2f} meters")
+    else:
+        print("No road found")
 
 #usage
 if __name__ == "__main__":
@@ -166,12 +151,8 @@ if __name__ == "__main__":
     create_table_if_not_exists(connection_string)
     
     # Insert data from GeoJSON file
-    insert_road_data(connection_string, geojson_file_path)
+    # insert_road_data(connection_string, geojson_file_path)
     
-    # Querying nearest road
-    lat, lon = -36.78, 174.55  # Example coordinates
-    nearest_road = query_nearest_road(connection_string, lat, lon)
-    if nearest_road:
-        print(f"Nearest road: {nearest_road[0]}, Speed limit: {nearest_road[1]} kph, Distance: {nearest_road[2]}")
-    else:
-        print("No road found")
+    # Test the insertion and querying
+    test_lat, test_lon = -36.758110, 174.729309  # Example coordinates
+    test_insertion_and_query(connection_string, test_lat, test_lon)
